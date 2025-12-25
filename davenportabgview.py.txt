@@ -1,0 +1,237 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
+
+# ----------------------------
+# Henderson–Hasselbalch helpers
+# ----------------------------
+def paco2_from_ph_hco3(ph, hco3, pK=6.1, alpha=0.03):
+    return hco3 / (alpha * (10 ** (ph - pK)))
+
+def hco3_from_ph_paco2(ph, paco2, pK=6.1, alpha=0.03):
+    return alpha * paco2 * (10 ** (ph - pK))
+
+# ----------------------------
+# Respiratory compensation lines (from your table)
+# Baseline normal: PaCO2=40, HCO3=24
+# ----------------------------
+def hco3_expected_resp(paco2, kind):
+    delta = paco2 - 40.0
+    if kind == "acute_ra":          # acute resp acidosis
+        return 24.0 + 1.0 * (delta / 10.0)
+    if kind == "chronic_ra":        # chronic resp acidosis
+        return 24.0 + 3.5 * (delta / 10.0)
+    if kind == "acute_ralk":        # acute resp alkalosis
+        return 24.0 + 2.0 * (delta / 10.0)   # delta negative -> decreases
+    if kind == "chronic_ralk_mid":  # chronic resp alkalosis midpoint (5–7 -> 6)
+        return 24.0 + 6.0 * (delta / 10.0)   # delta negative -> larger decrease
+    raise ValueError("Unknown kind")
+
+# ----------------------------
+# Zone classifier for the "flower"
+# ----------------------------
+def classify_zone(ph, hco3, paco2,
+                  tol_hco3=1.5,
+                  normal_ph=(7.35, 7.45),
+                  normal_hco3=(22, 26),
+                  normal_paco2=(35, 45)):
+    # Normal-ish
+    if (normal_ph[0] <= ph <= normal_ph[1] and
+        normal_hco3[0] <= hco3 <= normal_hco3[1] and
+        normal_paco2[0] <= paco2 <= normal_paco2[1]):
+        return 0
+
+    # Respiratory acidosis (PaCO2 > 40): acute vs chronic bands
+    if paco2 > 40:
+        h_acute = hco3_expected_resp(paco2, "acute_ra")
+        h_chronic = hco3_expected_resp(paco2, "chronic_ra")
+        if abs(hco3 - h_acute) <= tol_hco3:
+            return 3
+        if abs(hco3 - h_chronic) <= tol_hco3:
+            return 4
+        if min(h_acute, h_chronic) - tol_hco3 <= hco3 <= max(h_acute, h_chronic) + tol_hco3:
+            return 3 if abs(hco3 - h_acute) < abs(hco3 - h_chronic) else 4
+
+    # Respiratory alkalosis (PaCO2 < 40): acute vs chronic bands
+    if paco2 < 40:
+        h_acute = hco3_expected_resp(paco2, "acute_ralk")
+        h_chronic = hco3_expected_resp(paco2, "chronic_ralk_mid")
+        if abs(hco3 - h_acute) <= tol_hco3:
+            return 5
+        if abs(hco3 - h_chronic) <= tol_hco3:
+            return 6
+        if min(h_acute, h_chronic) - tol_hco3 <= hco3 <= max(h_acute, h_chronic) + tol_hco3:
+            return 5 if abs(hco3 - h_acute) < abs(hco3 - h_chronic) else 6
+
+    # Metabolic zones (simple HCO3 cutoffs as requested)
+    if hco3 < 24:
+        return 1
+    if hco3 > 24:
+        return 2
+
+    return 7
+
+# ----------------------------
+# Mount Sinai palette
+# ----------------------------
+MS_CERULEAN = "#06ABEB"
+MS_PINK     = "#DC298D"
+MS_BLUE     = "#212070"
+MS_DARK     = "#00002D"
+
+def plot_davenport_flower_mount_sinai(
+    ph_range=(6.9, 7.7),
+    hco3_range=(5, 45),
+    paco2_lines=(20, 30, 40, 50, 60, 80),
+    grid_n=450,
+    tol_hco3=1.7,          # slightly wider petals (tune to taste)
+    point=None,            # (pH, PaCO2) or (pH, HCO3)
+    point_mode="ph_paco2"  # "ph_paco2" or "ph_hco3"
+):
+    # Grid
+    ph = np.linspace(ph_range[0], ph_range[1], grid_n)
+    hco3 = np.linspace(hco3_range[0], hco3_range[1], grid_n)
+    PH, HCO3 = np.meshgrid(ph, hco3)
+    PACO2 = paco2_from_ph_hco3(PH, HCO3)
+
+    # Classify
+    Z = np.zeros_like(PH, dtype=int)
+    it = np.nditer(PH, flags=["multi_index"])
+    while not it.finished:
+        i, j = it.multi_index
+        Z[i, j] = classify_zone(
+            ph=float(PH[i, j]),
+            hco3=float(HCO3[i, j]),
+            paco2=float(PACO2[i, j]),
+            tol_hco3=tol_hco3
+        )
+        it.iternext()
+
+    # Zone color mapping (categorical)
+    # 0 Normal
+    # 1 Met Acidosis
+    # 2 Met Alkalosis
+    # 3 Acute Resp Acidosis
+    # 4 Chronic Resp Acidosis
+    # 5 Acute Resp Alkalosis
+    # 6 Chronic Resp Alkalosis
+    # 7 Other/Mixed
+    #
+    # Using Sinai colors + lighter tints via alpha rather than inventing new hexes.
+    zone_colors = [
+        MS_CERULEAN, # 0 Normal
+        MS_PINK,     # 1 Metabolic acidosis
+        MS_CERULEAN, # 2 Metabolic alkalosis (same hue, different alpha in plot)
+        MS_BLUE,     # 3 Acute resp acidosis
+        MS_DARK,     # 4 Chronic resp acidosis
+        MS_PINK,     # 5 Acute resp alkalosis (pink)
+        MS_BLUE,     # 6 Chronic resp alkalosis (blue)
+        "#BFC3D6"    # 7 Other/mixed = neutral cool gray
+    ]
+    cmap = ListedColormap(zone_colors)
+    bounds = np.arange(-0.5, 8.5, 1.0)
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    # Background flower zones
+    # Keep alpha modest so isopleths remain readable.
+    ax.contourf(PH, HCO3, Z, levels=bounds, cmap=cmap, norm=norm, alpha=0.28)
+
+    # Normal pH band (subtle)
+    ax.axvspan(7.35, 7.45, color=MS_CERULEAN, alpha=0.08)
+
+    # HCO3 reference line at 24 (using Sinai blue)
+    ax.axhline(24, linestyle="--", linewidth=1.2, color=MS_BLUE, alpha=0.9)
+
+    # PaCO2 isopleths (Sinai palette, with normal emphasized)
+    ph_line = np.linspace(ph_range[0], ph_range[1], 600)
+    line_colors = [MS_CERULEAN, MS_PINK, MS_BLUE, MS_CERULEAN, MS_PINK, MS_DARK]
+
+    for idx, pco2 in enumerate(paco2_lines):
+        hco3_line = hco3_from_ph_paco2(ph_line, pco2)
+        mask = (hco3_line >= hco3_range[0]) & (hco3_line <= hco3_range[1])
+
+        lw = 3.0 if pco2 == 40 else 2.0
+        col = MS_DARK if pco2 == 40 else line_colors[idx % len(line_colors)]
+        ax.plot(ph_line[mask], hco3_line[mask], linewidth=lw, color=col,
+                label=f"PaCO2 {pco2} mmHg", alpha=0.95)
+
+    # Normal point
+    ax.scatter([7.40], [24], s=85, color=MS_DARK, zorder=5)
+    ax.annotate("Normal\n(7.40, 24, 40)",
+                (7.40, 24),
+                textcoords="offset points",
+                xytext=(10, -18),
+                color=MS_DARK)
+
+    # Input point
+    if point is not None:
+        if point_mode == "ph_paco2":
+            ph_pt, paco2_pt = point
+            hco3_pt = float(hco3_from_ph_paco2(ph_pt, paco2_pt))
+        elif point_mode == "ph_hco3":
+            ph_pt, hco3_pt = point
+            paco2_pt = float(paco2_from_ph_hco3(ph_pt, hco3_pt))
+            hco3_pt = float(hco3_pt)
+        else:
+            raise ValueError("point_mode must be 'ph_paco2' or 'ph_hco3'")
+
+        zone_code = classify_zone(ph_pt, hco3_pt, paco2_pt, tol_hco3=tol_hco3)
+        zone_names = {
+            0: "Normal",
+            1: "Metabolic acidosis",
+            2: "Metabolic alkalosis",
+            3: "Acute respiratory acidosis",
+            4: "Chronic respiratory acidosis",
+            5: "Acute respiratory alkalosis",
+            6: "Chronic respiratory alkalosis",
+            7: "Other / mixed / outside expected bands",
+        }
+
+        ax.scatter([ph_pt], [hco3_pt], s=150, color=MS_PINK, edgecolor=MS_DARK, linewidth=1.0, zorder=6)
+        label = (
+            f"pH={ph_pt:.2f}, PaCO2={paco2_pt:.0f}, HCO3={hco3_pt:.1f}\n"
+            f"Zone: {zone_names.get(zone_code, 'Unknown')}"
+        )
+        ax.annotate(label, (ph_pt, hco3_pt), textcoords="offset points", xytext=(10, 10), color=MS_DARK)
+
+    # Axes & styling
+    ax.set_xlim(*ph_range)
+    ax.set_ylim(*hco3_range)
+    ax.set_xlabel("pH", color=MS_DARK)
+    ax.set_ylabel("[HCO₃⁻] (mEq/L)", color=MS_DARK)
+    ax.set_title("Davenport Diagram Flower — Mount Sinai Color Theme", color=MS_DARK)
+    ax.grid(alpha=0.18)
+
+    # Legend for clinical zones (proxy patches with tuned alpha)
+    zone_labels = [
+        ("Normal", 0, 0.35),
+        ("Metabolic acidosis", 1, 0.35),
+        ("Metabolic alkalosis", 2, 0.20),          # same cerulean, lighter
+        ("Acute respiratory acidosis", 3, 0.35),
+        ("Chronic respiratory acidosis", 4, 0.35),
+        ("Acute respiratory alkalosis", 5, 0.20),  # same pink, lighter
+        ("Chronic respiratory alkalosis", 6, 0.20),
+        ("Other/mixed", 7, 0.35),
+    ]
+    patches = [
+        mpatches.Patch(color=zone_colors[z], label=name, alpha=a)
+        for (name, z, a) in zone_labels
+    ]
+    leg1 = ax.legend(handles=patches, loc="upper left", title="Clinical zones", framealpha=0.92)
+    ax.add_artist(leg1)
+
+    # Legend for PaCO2 isopleths
+    ax.legend(loc="lower right", title="PaCO₂ isopleths", framealpha=0.92)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ----------------------------
+# Examples
+# ----------------------------
+plot_davenport_flower_mount_sinai(point=(7.25, 60), point_mode="ph_paco2")
+# plot_davenport_flower_mount_sinai(point=(7.52, 34), point_mode="ph_hco3")
